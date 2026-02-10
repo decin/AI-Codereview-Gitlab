@@ -93,6 +93,42 @@ class TestPullRequestHandler(TestCase):
             ]
         )
 
+    @patch.dict('os.environ', {'GITHUB_PR_APPROVE_SCORE_THRESHOLD': '80'}, clear=False)
+    def test_evaluate_approval_decision_should_approve(self):
+        review_result = """### 问题描述和优化建议
+1. 建议补充单元测试覆盖边界条件。
+
+### 评分明细
+总分: 82分
+"""
+        decision = self.handler.evaluate_approval_decision(review_result)
+        self.assertEqual(decision['event'], 'APPROVE')
+        self.assertEqual(decision['score'], 82)
+        self.assertEqual(decision['threshold'], 80)
+        self.assertEqual(decision['blockers'], [])
+
+    @patch.dict('os.environ', {'GITHUB_PR_APPROVE_SCORE_THRESHOLD': '80'}, clear=False)
+    def test_evaluate_approval_decision_should_request_changes_with_blocker(self):
+        review_result = """### 问题描述和优化建议
+1. This patch has a security risk and should be fixed.
+
+### 评分明细
+总分: 95分
+"""
+        decision = self.handler.evaluate_approval_decision(review_result)
+        self.assertEqual(decision['event'], 'REQUEST_CHANGES')
+        self.assertEqual(decision['score'], 95)
+        self.assertIn('security', decision['blockers'])
+
+    @patch.dict('os.environ', {'GITHUB_PR_APPROVE_SCORE_THRESHOLD': '80'}, clear=False)
+    def test_evaluate_approval_decision_should_request_changes_without_score(self):
+        review_result = """### 问题描述和优化建议
+1. 缺少必要的异常处理。
+"""
+        decision = self.handler.evaluate_approval_decision(review_result)
+        self.assertEqual(decision['event'], 'REQUEST_CHANGES')
+        self.assertEqual(decision['score'], 0)
+
     @patch('biz.platforms.github.webhook_handler.requests.post')
     def test_add_pull_request_notes_posts_inline_comments(self, mock_post):
         mock_response = MagicMock()
@@ -122,6 +158,40 @@ class TestPullRequestHandler(TestCase):
         self.assertEqual(first_call.kwargs['json']['path'], 'biz/demo.py')
         self.assertEqual(first_call.kwargs['json']['line'], 11)
         self.assertEqual(second_call.kwargs['json']['line'], 12)
+
+    @patch('biz.platforms.github.webhook_handler.requests.post')
+    def test_add_pull_request_notes_raises_when_comment_creation_fails(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.text = 'unprocessable entity'
+        mock_post.return_value = mock_response
+
+        changes = [
+            {
+                'new_path': 'biz/demo.py',
+                'diff': '@@ -10,2 +10,3 @@\n line10\n+added11\n line12'
+            }
+        ]
+        review_result = 'Auto Review Result:\n1. 第一条建议'
+
+        with self.assertRaises(RuntimeError):
+            self.handler.add_pull_request_notes(review_result, changes=changes)
+
+    @patch('biz.platforms.github.webhook_handler.requests.post')
+    def test_submit_pull_request_review_posts_correct_payload(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = 'ok'
+        mock_post.return_value = mock_response
+
+        self.handler.submit_pull_request_review(event='APPROVE', body='AI Review Decision: APPROVE')
+
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        self.assertIn('/pulls/99/reviews', call.args[0])
+        self.assertEqual(call.kwargs['json']['event'], 'APPROVE')
+        self.assertEqual(call.kwargs['json']['body'], 'AI Review Decision: APPROVE')
+        self.assertEqual(call.kwargs['headers']['Authorization'], 'token token')
 
 
 if __name__ == '__main__':

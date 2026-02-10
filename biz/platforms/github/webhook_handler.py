@@ -4,7 +4,16 @@ import time
 
 import requests
 import fnmatch
+from biz.utils.code_reviewer import CodeReviewer
 from biz.utils.log import logger
+
+
+DEFAULT_GITHUB_PR_APPROVE_SCORE_THRESHOLD = 80
+DEFAULT_GITHUB_PR_APPROVE_BLOCKER_KEYWORDS = [
+    '严重', '高风险', '安全', '漏洞', '阻断',
+    'critical', 'high risk', 'security', 'vulnerability', 'bug'
+]
+DEFAULT_GITHUB_PR_REVIEW_SUMMARY_MAX_LENGTH = 1200
 
 
 
@@ -239,22 +248,106 @@ class PullRequestHandler:
 
         return positions
 
-    def _add_pull_request_issue_comment(self, review_result: str):
-        url = f"https://api.github.com/repos/{self.repo_full_name}/issues/{self.pull_request_number}/comments"
+    @staticmethod
+    def _load_approve_score_threshold() -> int:
+        raw_threshold = os.environ.get('GITHUB_PR_APPROVE_SCORE_THRESHOLD', str(DEFAULT_GITHUB_PR_APPROVE_SCORE_THRESHOLD))
+        try:
+            return int(raw_threshold)
+        except ValueError:
+            logger.warning(
+                "Invalid GITHUB_PR_APPROVE_SCORE_THRESHOLD=%s, fallback to %s",
+                raw_threshold,
+                DEFAULT_GITHUB_PR_APPROVE_SCORE_THRESHOLD
+            )
+            return DEFAULT_GITHUB_PR_APPROVE_SCORE_THRESHOLD
+
+    @staticmethod
+    def _load_blocker_keywords() -> list:
+        env_keywords = os.environ.get('GITHUB_PR_APPROVE_BLOCKER_KEYWORDS', '')
+        keywords = list(DEFAULT_GITHUB_PR_APPROVE_BLOCKER_KEYWORDS)
+        if env_keywords:
+            for item in env_keywords.split(','):
+                keyword = item.strip().lower()
+                if keyword and keyword not in keywords:
+                    keywords.append(keyword)
+        return keywords
+
+    @classmethod
+    def _detect_blockers(cls, review_result: str) -> list:
+        comments = cls._split_review_to_comments(review_result)
+        if comments:
+            text = ' '.join(comments).lower()
+        else:
+            text = (review_result or '').lower()
+            score_section_match = re.search(r'(^|\n)\s*#{0,6}\s*(评分明细|总分)', text)
+            if score_section_match:
+                text = text[:score_section_match.start()].strip()
+        blockers = []
+        for keyword in cls._load_blocker_keywords():
+            if keyword and keyword in text:
+                blockers.append(keyword)
+        return blockers
+
+    @staticmethod
+    def _truncate_summary(review_result: str) -> str:
+        summary = re.sub(r'\s+', ' ', (review_result or '').strip())
+        if len(summary) <= DEFAULT_GITHUB_PR_REVIEW_SUMMARY_MAX_LENGTH:
+            return summary
+        return summary[:DEFAULT_GITHUB_PR_REVIEW_SUMMARY_MAX_LENGTH - 3] + '...'
+
+    def evaluate_approval_decision(self, review_result: str) -> dict:
+        score = CodeReviewer.parse_review_score(review_text=review_result)
+        threshold = self._load_approve_score_threshold()
+        blockers = self._detect_blockers(review_result)
+        approved = score >= threshold and len(blockers) == 0
+
+        if approved:
+            reason = 'Score reaches threshold and no blocker keywords were detected.'
+        elif score < threshold and blockers:
+            reason = 'Score is below threshold and blocker keywords were detected.'
+        elif score < threshold:
+            reason = 'Score is below threshold.'
+        else:
+            reason = 'Blocker keywords were detected in review result.'
+
+        return {
+            'event': 'APPROVE' if approved else 'REQUEST_CHANGES',
+            'score': score,
+            'threshold': threshold,
+            'blockers': blockers,
+            'reason': reason,
+        }
+
+    def _build_review_body(self, decision: dict, review_result: str) -> str:
+        blockers_text = ', '.join(decision.get('blockers', [])) if decision.get('blockers') else 'None'
+        summary = self._truncate_summary(review_result)
+
+        return (
+            f"AI Review Decision: {decision['event']}\n"
+            f"Score: {decision['score']} / {decision['threshold']}\n"
+            f"Blockers: {blockers_text}\n"
+            f"Reason: {decision['reason']}\n"
+            f"Summary: {summary}"
+        )
+
+    def submit_pull_request_review(self, event: str, body: str):
+        url = f"https://api.github.com/repos/{self.repo_full_name}/pulls/{self.pull_request_number}/reviews"
         headers = {
             'Authorization': f'token {self.github_token}',
             'Accept': 'application/vnd.github.v3+json'
         }
         data = {
-            'body': review_result
+            'event': event,
+            'body': body,
         }
         response = requests.post(url, headers=headers, json=data)
-        logger.debug(f"Add issue comment to GitHub PR {url}: {response.status_code}, {response.text}")
-        if response.status_code == 201:
-            logger.info("Issue comment successfully added to pull request.")
-        else:
-            logger.error(f"Failed to add issue comment: {response.status_code}")
+        logger.debug(
+            f"Submit PR review to GitHub {url}: {response.status_code}, {response.text}, payload: {data}")
+        if response.status_code != 200:
+            logger.error(f"Failed to submit PR review: {response.status_code}")
             logger.error(response.text)
+            raise RuntimeError(f"Failed to submit PR review, status={response.status_code}, event={event}")
+        logger.info("PR review submitted successfully: event=%s", event)
 
     def add_pull_request_notes(self, review_result, changes=None):
         comments = self._split_review_to_comments(review_result)
@@ -262,8 +355,7 @@ class PullRequestHandler:
             comments = [review_result.strip()]
 
         if not comments:
-            logger.info("No review comments to send for pull request.")
-            return
+            raise RuntimeError("No review comments to send for pull request.")
 
         try:
             max_comments = int(os.environ.get('GITHUB_PR_REVIEW_COMMENT_MAX_COUNT', '20'))
@@ -274,11 +366,10 @@ class PullRequestHandler:
         head_commit_id = self.webhook_data.get('pull_request', {}).get('head', {}).get('sha')
         positions = self._extract_review_positions(changes or [])
 
-        if not head_commit_id or not positions:
-            logger.warning(
-                "Missing head commit id or inline positions for PR review comments. Falling back to issue comment.")
-            self._add_pull_request_issue_comment(review_result)
-            return
+        if not head_commit_id:
+            raise RuntimeError("Missing pull request head commit id for PR review comments.")
+        if not positions:
+            raise RuntimeError("No valid inline comment positions extracted from pull request changes.")
 
         url = f"https://api.github.com/repos/{self.repo_full_name}/pulls/{self.pull_request_number}/comments"
         headers = {
@@ -286,7 +377,6 @@ class PullRequestHandler:
             'Accept': 'application/vnd.github.v3+json'
         }
 
-        success_count = 0
         for index, comment in enumerate(comments):
             position = positions[index % len(positions)]
             data = {
@@ -299,18 +389,13 @@ class PullRequestHandler:
             response = requests.post(url, headers=headers, json=data)
             logger.debug(
                 f"Add PR review comment to GitHub {url}: {response.status_code}, {response.text}, payload: {data}")
-            if response.status_code == 201:
-                success_count += 1
-            else:
+            if response.status_code != 201:
                 logger.error(f"Failed to add PR review comment: {response.status_code}")
                 logger.error(response.text)
+                raise RuntimeError(
+                    f"Failed to add PR review comment, status={response.status_code}, path={position['path']}, line={position['line']}")
 
-        if success_count == 0:
-            logger.warning("Failed to add all PR review comments. Falling back to issue comment.")
-            self._add_pull_request_issue_comment(review_result)
-            return
-
-        logger.info(f"PR review comments added: {success_count}/{len(comments)}")
+        logger.info(f"PR review comments added: {len(comments)}/{len(comments)}")
 
     def target_branch_protected(self) -> bool:
         url = f"https://api.github.com/repos/{self.repo_full_name}/branches?protected=true"

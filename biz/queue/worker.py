@@ -277,8 +277,11 @@ def handle_github_pull_request_event(webhook_data: dict, github_token: str, gith
         commits_text = ';'.join(commit['title'] for commit in commits)
         review_result = CodeReviewer().review_and_strip_code(str(changes), commits_text)
 
-        # 将review结果提交到GitHub的 notes
+        # 将review结果提交到GitHub的 inline comments
         handler.add_pull_request_notes(f'Auto Review Result: \n{review_result}', changes=changes)
+        approval_decision = handler.evaluate_approval_decision(review_result)
+        review_body = handler._build_review_body(approval_decision, review_result)
+        handler.submit_pull_request_review(event=approval_decision['event'], body=review_body)
 
         # dispatch pull_request_reviewed event
         event_manager['merge_request_reviewed'].send(
@@ -289,7 +292,7 @@ def handle_github_pull_request_event(webhook_data: dict, github_token: str, gith
                 target_branch=webhook_data['pull_request']['base']['ref'],
                 updated_at=int(datetime.now().timestamp()),
                 commits=commits,
-                score=CodeReviewer.parse_review_score(review_text=review_result),
+                score=approval_decision['score'],
                 url=webhook_data['pull_request']['html_url'],
                 review_result=review_result,
                 url_slug=github_url_slug,
