@@ -278,7 +278,7 @@ def handle_github_pull_request_event(webhook_data: dict, github_token: str, gith
         review_result = CodeReviewer().review_and_strip_code(str(changes), commits_text)
 
         # 将review结果提交到GitHub的 notes
-        handler.add_pull_request_notes(f'Auto Review Result: \n{review_result}')
+        handler.add_pull_request_notes(f'Auto Review Result: \n{review_result}', changes=changes)
 
         # dispatch pull_request_reviewed event
         event_manager['merge_request_reviewed'].send(

@@ -159,7 +159,87 @@ class PullRequestHandler:
             logger.warn(f"Failed to get commits: {response.status_code}, {response.text}")
             return []
 
-    def add_pull_request_notes(self, review_result):
+    @staticmethod
+    def _split_review_to_comments(review_result: str) -> list:
+        if not review_result:
+            return []
+
+        text = review_result.strip()
+        text = re.sub(r'^\s*Auto Review Result[:：]\s*', '', text, flags=re.IGNORECASE)
+        if not text:
+            return []
+
+        # 评分区块通常不是逐条行内评论内容，优先截断掉
+        score_section_match = re.search(r'(^|\n)\s*#{0,6}\s*(评分明细|总分)', text)
+        if score_section_match:
+            text = text[:score_section_match.start()].strip()
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        bullet_items = []
+        for line in lines:
+            bullet_match = re.match(r'^[-*+]\s+(.+)$', line)
+            ordered_match = re.match(r'^\d+[\.、\)]\s*(.+)$', line)
+            if bullet_match:
+                bullet_items.append(bullet_match.group(1).strip())
+            elif ordered_match:
+                bullet_items.append(ordered_match.group(1).strip())
+
+        if bullet_items:
+            return bullet_items
+
+        comments = []
+        for block in re.split(r'\n\s*\n', text):
+            item = block.strip()
+            if not item or item.startswith('#'):
+                continue
+            if item in ['问题描述和优化建议', '问题描述', '优化建议']:
+                continue
+            comments.append(re.sub(r'\s+', ' ', item))
+        return comments
+
+    @staticmethod
+    def _extract_comment_lines_from_diff(diff: str) -> list:
+        if not diff:
+            return []
+
+        comment_lines = []
+        current_new_line = None
+        for raw_line in diff.splitlines():
+            if raw_line.startswith('@@'):
+                match = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', raw_line)
+                current_new_line = int(match.group(1)) if match else None
+                continue
+
+            if current_new_line is None:
+                continue
+
+            if raw_line.startswith('+') and not raw_line.startswith('+++'):
+                comment_lines.append(current_new_line)
+                current_new_line += 1
+                continue
+
+            if raw_line.startswith('-') and not raw_line.startswith('---'):
+                continue
+
+            current_new_line += 1
+
+        return comment_lines
+
+    @classmethod
+    def _extract_review_positions(cls, changes: list) -> list:
+        positions = []
+        for change in changes or []:
+            path = change.get('new_path') or change.get('filename') or change.get('old_path')
+            if not path:
+                continue
+
+            diff = change.get('diff') or change.get('patch') or ''
+            for line in cls._extract_comment_lines_from_diff(diff):
+                positions.append({'path': path, 'line': line})
+
+        return positions
+
+    def _add_pull_request_issue_comment(self, review_result: str):
         url = f"https://api.github.com/repos/{self.repo_full_name}/issues/{self.pull_request_number}/comments"
         headers = {
             'Authorization': f'token {self.github_token}',
@@ -169,12 +249,68 @@ class PullRequestHandler:
             'body': review_result
         }
         response = requests.post(url, headers=headers, json=data)
-        logger.debug(f"Add comment to GitHub PR {url}: {response.status_code}, {response.text}")
+        logger.debug(f"Add issue comment to GitHub PR {url}: {response.status_code}, {response.text}")
         if response.status_code == 201:
-            logger.info("Comment successfully added to pull request.")
+            logger.info("Issue comment successfully added to pull request.")
         else:
-            logger.error(f"Failed to add comment: {response.status_code}")
+            logger.error(f"Failed to add issue comment: {response.status_code}")
             logger.error(response.text)
+
+    def add_pull_request_notes(self, review_result, changes=None):
+        comments = self._split_review_to_comments(review_result)
+        if not comments and review_result:
+            comments = [review_result.strip()]
+
+        if not comments:
+            logger.info("No review comments to send for pull request.")
+            return
+
+        try:
+            max_comments = int(os.environ.get('GITHUB_PR_REVIEW_COMMENT_MAX_COUNT', '20'))
+        except ValueError:
+            max_comments = 20
+        comments = comments[:max(1, max_comments)]
+
+        head_commit_id = self.webhook_data.get('pull_request', {}).get('head', {}).get('sha')
+        positions = self._extract_review_positions(changes or [])
+
+        if not head_commit_id or not positions:
+            logger.warning(
+                "Missing head commit id or inline positions for PR review comments. Falling back to issue comment.")
+            self._add_pull_request_issue_comment(review_result)
+            return
+
+        url = f"https://api.github.com/repos/{self.repo_full_name}/pulls/{self.pull_request_number}/comments"
+        headers = {
+            'Authorization': f'token {self.github_token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+
+        success_count = 0
+        for index, comment in enumerate(comments):
+            position = positions[index % len(positions)]
+            data = {
+                'body': comment,
+                'commit_id': head_commit_id,
+                'path': position['path'],
+                'line': position['line'],
+                'side': 'RIGHT'
+            }
+            response = requests.post(url, headers=headers, json=data)
+            logger.debug(
+                f"Add PR review comment to GitHub {url}: {response.status_code}, {response.text}, payload: {data}")
+            if response.status_code == 201:
+                success_count += 1
+            else:
+                logger.error(f"Failed to add PR review comment: {response.status_code}")
+                logger.error(response.text)
+
+        if success_count == 0:
+            logger.warning("Failed to add all PR review comments. Falling back to issue comment.")
+            self._add_pull_request_issue_comment(review_result)
+            return
+
+        logger.info(f"PR review comments added: {success_count}/{len(comments)}")
 
     def target_branch_protected(self) -> bool:
         url = f"https://api.github.com/repos/{self.repo_full_name}/branches?protected=true"
